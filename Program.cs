@@ -5,20 +5,21 @@ using AIResumeChatApp.Services.Ingestion;
 using OpenAI;
 using System.ClientModel;
 using OllamaSharp;
+using Microsoft.Data.Sqlite;
+using Microsoft.AspNetCore.Builder;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.Hosting;
 
 var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddRazorComponents().AddInteractiveServerComponents();
 
-//var uri = new Uri("http://localhost:11434");
-//var ollama = new OllamaApiClient(uri);
-//ollama.SelectedModel = "phi3:mini";
+// --- GitHub Models client (unchanged) ---
+var credential = new ApiKeyCredential(
+    builder.Configuration["GitHubModels:Token"]
+    ?? throw new InvalidOperationException("Missing configuration: GitHubModels:Token. See the README for details.")
+);
 
-// You will need to set the endpoint and key to your own values
-// You can do this using Visual Studio's "Manage User Secrets" UI, or on the command line:
-//   cd this-project-directory
-//   dotnet user-secrets set GitHubModels:Token YOUR-GITHUB-TOKEN
-var credential = new ApiKeyCredential(builder.Configuration["GitHubModels:Token"] ?? throw new InvalidOperationException("Missing configuration: GitHubModels:Token. See the README for details."));
-var openAIOptions = new OpenAIClientOptions()
+var openAIOptions = new OpenAIClientOptions
 {
     Endpoint = new Uri("https://models.inference.ai.azure.com")
 };
@@ -27,11 +28,22 @@ var ghModelsClient = new OpenAIClient(credential, openAIOptions);
 var chatClient = ghModelsClient.GetChatClient("gpt-4o-mini").AsIChatClient();
 var embeddingGenerator = ghModelsClient.GetEmbeddingClient("text-embedding-3-small").AsIEmbeddingGenerator();
 
-var vectorStorePath = Path.Combine(AppContext.BaseDirectory, "vector-store.db");
-var vectorStoreConnectionString = $"Data Source={vectorStorePath}";
+// --- Writable, persistent path on Azure App Service ---
+var home = Environment.GetEnvironmentVariable("HOME") ?? AppContext.BaseDirectory;
+// %HOME% -> D:\home or C:\home on Windows App Service
+var dataDir = Path.Combine(home, "data", "AIResumeChatApp");
+Directory.CreateDirectory(dataDir);
+
+// Vector DB under HOME\data
+var vectorStorePath = Path.Combine(dataDir, "vector-store.db");
+// Optional: Shared cache & pooling can improve concurrent access a bit
+var vectorStoreConnectionString = $"Data Source={vectorStorePath};Cache=Shared;Pooling=True";
+
+// Register your SQLite-backed collections
 builder.Services.AddSqliteCollection<string, IngestedChunk>("data-airesumechatapp-chunks", vectorStoreConnectionString);
 builder.Services.AddSqliteCollection<string, IngestedDocument>("data-airesumechatapp-documents", vectorStoreConnectionString);
 
+// App services
 builder.Services.AddScoped<DataIngestor>();
 builder.Services.AddSingleton<SemanticSearch>();
 builder.Services.AddChatClient(chatClient).UseFunctionInvocation().UseLogging();
@@ -43,23 +55,44 @@ var app = builder.Build();
 if (!app.Environment.IsDevelopment())
 {
     app.UseExceptionHandler("/Error", createScopeForErrors: true);
-    // The default HSTS value is 30 days. You may want to change this for production scenarios, see https://aka.ms/aspnetcore-hsts.
     app.UseHsts();
 }
 
 app.UseHttpsRedirection();
 app.UseAntiforgery();
-
 app.UseStaticFiles();
-app.MapRazorComponents<App>()
-    .AddInteractiveServerRenderMode();
 
-// By default, we ingest PDF files from the /wwwroot/Data directory. You can ingest from
-// other sources by implementing IIngestionSource.
-// Important: ensure that any content you ingest is trusted, as it may be reflected back
-// to users or could be a source of prompt injection risk.
-await DataIngestor.IngestDataAsync(
-    app.Services,
-    new PDFDirectorySource(Path.Combine(builder.Environment.WebRootPath, "Data")));
+app.MapRazorComponents<App>()
+   .AddInteractiveServerRenderMode();
+
+// ---- One-time SQLite tuning (optional but recommended on SMB-backed storage) ----
+// Set WAL mode to reduce file locking contention.
+try
+{
+    using var conn = new SqliteConnection(vectorStoreConnectionString);
+    await conn.OpenAsync();
+    using var cmd = conn.CreateCommand();
+    cmd.CommandText = "PRAGMA journal_mode=WAL;";
+    await cmd.ExecuteNonQueryAsync();
+}
+catch
+{
+    // ignore if initialization fails; the app can still run
+}
+
+// ---- Ingestion source paths ----
+// If you only READ PDFs that ship with the app, wwwroot is fine (even if read-only).
+// If you want to DROP new PDFs at runtime, use a writable HOME-based folder instead.
+var packagedPdfDir = Path.Combine(app.Environment.WebRootPath, "Data");
+var writablePdfDir = Path.Combine(dataDir, "Content"); // e.g., D:\home\data\AIResumeChatApp\Content
+Directory.CreateDirectory(writablePdfDir);
+
+// Prefer the writable folder if it has files; otherwise fall back to packaged PDFs
+var pdfSourceDir = Directory.EnumerateFiles(writablePdfDir, "*.pdf", SearchOption.AllDirectories).Any()
+    ? writablePdfDir
+    : packagedPdfDir;
+
+// Important: only ingest trusted content
+await DataIngestor.IngestDataAsync(app.Services, new PDFDirectorySource(pdfSourceDir));
 
 app.Run();
